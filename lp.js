@@ -109,17 +109,14 @@ async function init(load=_ => {}, input=_ => {}) {
 // }
 
 function hueToRGB(hue) {
-	let c = 127;
 	let x = (1 - Math.abs((hue / 60) % 2 - 1)) * 127;
 	let r = 0, g = 0, b = 0;
-
-		 if (hue >= 0   && hue < 60)  [r, g, b] = [c, x, 0];
-	else if (hue >= 60  && hue < 120) [r, g, b] = [x, c, 0];
-	else if (hue >= 120 && hue < 180) [r, g, b] = [0, c, x];
-	else if (hue >= 180 && hue < 240) [r, g, b] = [0, x, c];
-	else if (hue >= 240 && hue < 300) [r, g, b] = [x, 0, c];
-	else if (hue >= 300 && hue < 360) [r, g, b] = [c, 0, x];
-
+		 if (hue >= 0   && hue < 60)  [r, g, b] = [127, x, 0];
+	else if (hue >= 60  && hue < 120) [r, g, b] = [x, 127, 0];
+	else if (hue >= 120 && hue < 180) [r, g, b] = [0, 127, x];
+	else if (hue >= 180 && hue < 240) [r, g, b] = [0, x, 127];
+	else if (hue >= 240 && hue < 300) [r, g, b] = [x, 0, 127];
+	else if (hue >= 300 && hue < 360) [r, g, b] = [127, 0, x];
 	return [r, g, b].map(Math.floor);
 }
 
