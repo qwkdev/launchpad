@@ -1,7 +1,9 @@
 #![allow(dead_code)]
+use chrono::Local;
 use midir::{MidiInput, MidiOutput, MidiOutputConnection};
 use std::error::Error;
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc::{self, RecvTimeoutError, Sender},
 };
@@ -15,27 +17,46 @@ static MODE: AtomicU8 = AtomicU8::new(0);
 struct Interval {
     stop_tx: Option<Sender<()>>,
     handle: Option<JoinHandle<()>>,
+    callback: Arc<dyn Fn(&mut MidiOutputConnection) + Send + Sync + 'static>,
+    connection: Arc<Mutex<MidiOutputConnection>>,
+    duration: Duration,
 }
 
 impl Interval {
-    fn new() -> Self {
+    fn new<F>(callback: F, connection: Arc<Mutex<MidiOutputConnection>>, duration: Duration) -> Self
+    where
+        F: Fn(&mut MidiOutputConnection) + Send + Sync + 'static,
+    {
         Self {
             stop_tx: None,
             handle: None,
+            callback: Arc::new(callback),
+            connection,
+            duration,
         }
     }
 
+    // lout: &mut MidiOutputConnection
     fn start(&mut self) {
         if self.handle.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         self.stop_tx = Some(tx);
+
+        let callback = Arc::clone(&self.callback);
+        let connection = Arc::clone(&self.connection);
+        let duration = self.duration;
+
         self.handle = Some(thread::spawn(move || {
             loop {
-                loop_update();
+                // callback(lout);
+                {
+                    let mut midi = connection.lock().unwrap();
+                    callback(&mut midi);
+                }
 
-                match rx.recv_timeout(Duration::from_secs(5)) {
+                match rx.recv_timeout(duration) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
                 }
@@ -53,10 +74,6 @@ impl Interval {
     }
 }
 
-fn loop_update() {
-    println!("Running...");
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let midi_out = MidiOutput::new("Launchpad Rust Output")?;
     let out_port = midi_out
@@ -69,17 +86,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap_or(false)
         })
         .ok_or("Launchpad X output port not found")?;
-    let mut lout = midi_out.connect(&out_port, "launchpad-output")?;
+    // let mut lout = midi_out.connect(&out_port, "launchpad-output")?;
+
+    let loutc = Arc::new(Mutex::new(midi_out.connect(&out_port, "launchpad-output")?));
 
     // let message: [u8; 13] = [240, 0, 32, 41, 2, 12, 3, 3, 99, 0, 0, 124, 247];
     // lout.send(&message)?;
-    set_leds(&mut lout, &[vec![71, 0, 5], vec![72, 0, 42]])?;
+    {
+        let mut lout = loutc.lock().unwrap();
 
-    set_all_leds(&mut lout, [0, 0].as_slice())?;
-    led_palette(&mut lout)?;
+        let message: [u8; 9] = [0xF0, 0x00, 0x20, 0x29, 0x02, 0x0C, 0x0E, 0x01, 0xF7];
+        lout.send(&message)?;
 
+        set_all_leds(&mut lout, [0, 0].as_slice())?;
+    }
     let mut updaters: Vec<Interval> = Vec::new();
-    updaters.push(Interval::new());
+    updaters.push(Interval::new(
+        clock_update,
+        Arc::clone(&loutc),
+        Duration::from_secs(10),
+    ));
 
     let midi_in = MidiInput::new("Launchpad Rust Input")?;
     let in_port = midi_in
@@ -108,6 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (),
     )?;
     for note in rx {
+        let mut lout = loutc.lock().unwrap();
         handle_input(&mut lout, note[0], note[1], &mut updaters);
     }
 
@@ -229,6 +256,9 @@ fn update(lout: &mut MidiOutputConnection, mode: u8, updaters: &mut [Interval]) 
             );
         }
         2 => {
+            let _ = led_palette(lout);
+        }
+        3 => {
             if let Some(updater) = updaters.get_mut(0) {
                 updater.start();
             }
@@ -251,15 +281,88 @@ fn handle_input(lout: &mut MidiOutputConnection, note: u8, vel: u8, updaters: &m
         if note == 29 {
             update(lout, 0, updaters)
         }
+        if note == 39 {
+            update(lout, 2, updaters)
+        }
 
         match MODE.load(Ordering::Relaxed) {
             1 => match note {
-                18 => update(lout, 2, updaters),
-                17 => update(lout, 3, updaters),
+                18 => update(lout, 3, updaters),
+                17 => update(lout, 4, updaters),
                 _ => {}
             },
-            3 => update(lout, 4, updaters),
+            2 => {
+                if (note % 10) > 8 {
+                    return;
+                }
+                let noteclr: u8 = (8 - (note / 10)) * 8 + note % 10 - 1;
+                let mut spec: Vec<Vec<u8>> = Vec::new();
+                for i in 0..2 {
+                    let index = if i == 0 { noteclr / 10 } else { noteclr % 10 };
+                    if i == 0 && index == 0 {
+                        continue;
+                    }
+                    for r in 0..4 {
+                        for c in 0..4 {
+                            spec.push(vec![
+                                (if note / 10 <= 4 { 81 } else { 41 } + (i as u8 % 2) * 4)
+                                    - (10 * r)
+                                    + c,
+                                0,
+                                DIGITS_PX[index as usize][r as usize][c as usize] * noteclr,
+                            ]);
+                        }
+                    }
+                }
+                let _ = set_leds(lout, &spec);
+            }
+            4 => update(lout, 5, updaters),
+            _ => {}
+        }
+    } else {
+        match MODE.load(Ordering::Relaxed) {
+            2 => {
+                let _ = led_palette(lout);
+            }
+            67 => {}
             _ => {}
         }
     }
+}
+
+//
+
+static DIGITS_PX: [[[u8; 4]; 4]; 10] = [
+    [[0, 1, 1, 0], [1, 0, 0, 1], [1, 0, 0, 1], [0, 1, 1, 0]],
+    [[0, 0, 1, 0], [1, 1, 1, 0], [0, 0, 1, 0], [1, 1, 1, 1]],
+    [[1, 1, 1, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 1, 1, 1]],
+    [[1, 1, 1, 0], [0, 0, 1, 1], [0, 0, 0, 1], [1, 1, 1, 1]],
+    [[1, 0, 0, 1], [1, 0, 0, 1], [1, 1, 1, 1], [0, 0, 0, 1]],
+    [[0, 1, 1, 1], [0, 1, 0, 0], [0, 0, 1, 0], [1, 1, 1, 0]],
+    [[0, 1, 1, 1], [1, 0, 0, 0], [1, 1, 1, 1], [1, 1, 1, 1]],
+    [[1, 1, 1, 1], [0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0]],
+    [[1, 1, 1, 0], [1, 0, 1, 1], [1, 1, 0, 1], [0, 1, 1, 1]],
+    [[1, 1, 1, 1], [1, 0, 0, 1], [1, 1, 1, 1], [0, 0, 0, 1]],
+];
+static DIGITS_CLR: [u8; 10] = [37, 45, 49, 54, 3, 5, 9, 13, 21, 29];
+
+fn clock_update(lout: &mut MidiOutputConnection) {
+    let now = Local::now();
+    let time = now.format("%H%M").to_string();
+
+    let mut spec: Vec<Vec<u8>> = Vec::new();
+    for (i, ch) in time.chars().enumerate() {
+        let index = ch.to_digit(10).unwrap() as usize;
+        for r in 0..4 {
+            for c in 0..4 {
+                spec.push(vec![
+                    (81 - ((i as u8 / 2) * 40) + (i as u8 % 2) * 4) - (10 * r) + c,
+                    0,
+                    DIGITS_PX[index][r as usize][c as usize] * DIGITS_CLR[index],
+                ]);
+            }
+        }
+    }
+
+    let _ = set_leds(lout, &spec);
 }
